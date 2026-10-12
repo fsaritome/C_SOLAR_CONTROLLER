@@ -16,13 +16,14 @@
 #include <ArduinoOTA.h>
 #include <ESP8266mDNS.h>
 #include <TelnetStream.h>
+#include "secrets.h"  // Wi-Fi and OTA passwords live here, outside git (see secrets.example.h)
 
 // --- Pin Definitions ---
 #define INVERTER_PIN D7  // GPIO pin connected to the inverter control
 
 // --- Network Configuration ---
-const char *ssid = "IOT-Hadal";
-const char *password = "Chr0nowirelessisdabest";
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
 const uint16_t SERVER_PORT = 8664;
 
 // --- Global Variables ---
@@ -463,7 +464,7 @@ void setupOTA() {
   ArduinoOTA.setHostname("solar_inverter");
 
   // Set password for OTA updates
-  ArduinoOTA.setPassword("solar123");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
 
   ArduinoOTA.onStart([]() {
     String type;
