@@ -5,3 +5,5 @@
 #define OTA_PASSWORD "choose-an-ota-password"
 // Needed for POST /on, /off, /unlock as ?token=...; at least 16 characters, letters and digits.
 #define API_TOKEN "choose-a-long-random-token"
+// solar2's metrics by fixed IP (no DNS dependency), e.g. "http://192.168.1.50/metrics"
+#define SOLAR2_METRICS_URL "http://192.168.1.50/metrics"

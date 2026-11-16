@@ -19,6 +19,12 @@
 #include <TelnetStream.h>
 #include "secrets.h"  // Wi-Fi and OTA passwords live here, outside git (see secrets.example.h)
 
+// Where solar2's Prometheus metrics are read. Set it in secrets.h to solar2's fixed IP, so a DNS outage can't
+// stop the readings (and with them the inverter); the name below is only the fallback.
+#ifndef SOLAR2_METRICS_URL
+#define SOLAR2_METRICS_URL "http://solar2/metrics"
+#endif
+
 // --- Pin Definitions ---
 #define INVERTER_PIN D7  // GPIO pin connected to the inverter control
 
@@ -134,7 +140,7 @@ void checkBatteryAlarmAndShutdown() {
   WiFiClient client;
   HTTPClient http;
   http.setTimeout(2000);
-  http.begin(client, "http://solar2.powdersplash.com/metrics");
+  http.begin(client, SOLAR2_METRICS_URL);
   yield();
   int httpCode = http.GET();
 
@@ -174,7 +180,7 @@ void checkBatteryAlarmAndShutdown() {
       while (valueEnd < (int)payload.length() && !isspace(payload[valueEnd])) valueEnd++;
       String valueStr = payload.substring(valueStart, valueEnd);
       lastBatteryHasAlarm = valueStr;
-      if (valueStr == "1.000000") batteryAlarm = true;
+      if (valueStr.toFloat() >= 0.5f) batteryAlarm = true;
     }
   }
 
@@ -191,7 +197,7 @@ void checkBatteryAlarmAndShutdown() {
         while (valueEnd < (int)payload.length() && !isspace(payload[valueEnd])) valueEnd++;
         String valueStr = payload.substring(valueStart, valueEnd);
         lastMpptHasError = valueStr;
-        if (valueStr == "1.000000") mpptError = true;
+        if (valueStr.toFloat() >= 0.5f) mpptError = true;
       }
     }
   }
@@ -209,7 +215,7 @@ void checkBatteryAlarmAndShutdown() {
         while (valueEnd < (int)payload.length() && !isspace(payload[valueEnd])) valueEnd++;
         String valueStr = payload.substring(valueStart, valueEnd);
         lastMpptFaultState = valueStr;
-        if (valueStr == "1.000000") mpptError = true;
+        if (valueStr.toFloat() >= 0.5f) mpptError = true;
       }
     }
   }
@@ -332,7 +338,7 @@ void setupWebServer() {
     content += "# TYPE battery_has_alarm gauge\n";
     content += "battery_has_alarm " + lastBatteryHasAlarm + "\n";
     
-    content += "# HELP solar2_connection_status shows if solar2.powdersplash.com is reachable (1=reachable, 0=not)\n";
+    content += "# HELP solar2_connection_status shows if solar2 is reachable (1=reachable, 0=not)\n";
     content += "# TYPE solar2_connection_status gauge\n";
     content += "solar2_connection_status " + String(solar2ConnectionStatus) + "\n";
 
