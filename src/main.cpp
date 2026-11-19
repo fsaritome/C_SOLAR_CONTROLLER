@@ -5,6 +5,8 @@
  * and controls an inverter based on battery and MPPT status.
  * It also provides a web server with endpoints for metrics and inverter control.
  * Control (POST /on, /off, /unlock) needs ?token=<API_TOKEN from secrets.h>; telnet is read-only.
+ * Optional AUTO_TOKEN (secrets.h) is accepted only by POST /on: an automation (e.g. a mains-outage handler) can
+ * switch on an unlocked inverter but can never unlock it or lock it. Without AUTO_TOKEN that path is disabled.
  */
 
 // --- Includes ---
@@ -18,6 +20,9 @@
 #include <ESP8266mDNS.h>
 #include <TelnetStream.h>
 #include "secrets.h"  // Wi-Fi and OTA passwords live here, outside git (see secrets.example.h)
+#ifndef AUTO_TOKEN
+#define AUTO_TOKEN ""  // empty = the on-only automation token is disabled
+#endif
 
 // Where solar2's Prometheus metrics are read. Set it in secrets.h to solar2's fixed IP, so a DNS outage can't
 // stop the readings (and with them the inverter); the name below is only the fallback.
@@ -36,6 +41,7 @@ const uint16_t SERVER_PORT = 8664;
 // --- Global Variables ---
 bool locked = true;                   // Manual inverter lock (operator-controlled)
 bool alarmActive = false;             // Safety lock: set on alarm, blocks /unlock and /on until alarm clears
+bool lastOnAuto = false;              // true if the last successful /on came with AUTO_TOKEN (automation)
 String lastBatteryHasAlarm = "0";     // Last battery alarm value from solar2
 int solar2ConnectionStatus = 0;       // Solar2 connection status (1 = reachable, 0 = unreachable)
 int solar2ReadFailCount = 0;          // Counter for consecutive failed reads
@@ -298,16 +304,21 @@ void checkBatteryAlarmAndShutdown() {
  * (a query parameter keeps the browser request "simple", so no CORS preflight is needed).
  * Compared in constant time.
  */
-bool authorized(AsyncWebServerRequest *request) {
+bool tokenMatches(AsyncWebServerRequest *request, const char *expected) {
   if (!request->hasParam("token")) return false;
   const String &given = request->getParam("token")->value();
-  const char *expected = API_TOKEN;
   size_t n = strlen(expected);
   if (n < 16 || given.length() != n) return false;
   uint8_t diff = 0;
   for (size_t i = 0; i < n; i++) diff |= (uint8_t)given[i] ^ (uint8_t)expected[i];
   return diff == 0;
 }
+
+// The operator token: all control endpoints.
+bool authorized(AsyncWebServerRequest *request) { return tokenMatches(request, API_TOKEN); }
+
+// The automation token: POST /on only (never /unlock or /off).
+bool authorizedAuto(AsyncWebServerRequest *request) { return tokenMatches(request, AUTO_TOKEN); }
 
 void addCors(AsyncWebServerRequest *request, AsyncWebServerResponse *response) {
   String origin = request->header("Origin");
@@ -357,6 +368,14 @@ void setupWebServer() {
     content += "# HELP alarm_active 1 if any alarm is blocking the inverter\n";
     content += "# TYPE alarm_active gauge\n";
     content += "alarm_active " + String(alarmActive ? 1 : 0) + "\n";
+
+    content += "# HELP inverter_locked 1 if the inverter is locked (boot, /off, alarm, link loss); /on is refused until /unlock\n";
+    content += "# TYPE inverter_locked gauge\n";
+    content += "inverter_locked " + String(locked ? 1 : 0) + "\n";
+
+    content += "# HELP inverter_last_on_auto 1 if the last successful /on came from the automation token\n";
+    content += "# TYPE inverter_last_on_auto gauge\n";
+    content += "inverter_last_on_auto " + String(lastOnAuto ? 1 : 0) + "\n";
 
     content += "# HELP solar2_data_age_ms milliseconds since last successful solar2 read\n";
     content += "# TYPE solar2_data_age_ms gauge\n";
@@ -419,20 +438,25 @@ void setupWebServer() {
 
   // Turn inverter ON endpoint
   server.on("/on", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!authorized(request)) { rejectUnauthorized(request, "/on"); return; }
+    bool manual = authorized(request);
+    bool automatic = !manual && authorizedAuto(request);
+    if (!manual && !automatic) { rejectUnauthorized(request, "/on"); return; }
+    const char *by = automatic ? "auto" : "operator";
+    String ip = request->client()->remoteIP().toString();
     AsyncWebServerResponse *response;
     if (alarmActive) {
       response = request->beginResponse(409, "text/plain",
         "inverter blocked: alarm active (battery=" + lastBatteryHasAlarm + " mppt=" + lastMpptHasError + ")");
-      logf("Inverter ON rejected: alarm active (battery=%s mppt=%s)\n",
+      logf("Inverter ON (%s, %s) rejected: alarm active (battery=%s mppt=%s)\n", by, ip.c_str(),
            lastBatteryHasAlarm.c_str(), lastMpptHasError.c_str());
     } else if (locked) {
       response = request->beginResponse(404, "text/plain", "inverter locked");
-      log("Inverter ON request rejected - locked!");
+      logf("Inverter ON (%s, %s) rejected - locked!\n", by, ip.c_str());
     } else {
       digitalWrite(INVERTER_PIN, HIGH);
+      lastOnAuto = automatic;
       response = request->beginResponse(200, "text/plain", "inverter turned on");
-      log("Inverter turned ON!");
+      logf("Inverter turned ON (%s, %s)!\n", by, ip.c_str());
     }
 
     addCors(request, response);
@@ -541,6 +565,7 @@ void handleTelnetMenu() {
     TelnetStream.printf("  Inverter pin  : %s\r\n", digitalRead(INVERTER_PIN) ? "ON" : "OFF");
     TelnetStream.printf("  Locked        : %s\r\n", locked ? "YES" : "NO");
     TelnetStream.printf("  Alarm active  : %s\r\n", alarmActive ? "YES" : "NO");
+    TelnetStream.printf("  Last ON by    : %s\r\n", lastOnAuto ? "automation" : "operator");
     TelnetStream.printf("  Battery alarm : %s\r\n", lastBatteryHasAlarm.c_str());
     TelnetStream.printf("  Battery V     : %s V\r\n", lastBatteryVoltage.c_str());
     TelnetStream.printf("  Battery A     : %s A\r\n", lastBatteryCurrent.c_str());
