@@ -14,6 +14,8 @@
  *  - SOFT = after boot, after /off, after a hard lock cleared. Operator /on is refused until /unlock;
  *    the AUTO token may switch on.
  *  - NONE = after /unlock (operator token). Operator /on works.
+ *  - POST /hardlock (operator token): inverter off + HARD lock "operator hard lock" (maintenance / tests); only
+ *    POST /hardunlock (operator token) lifts it, not conditions clearing. Not kept across a restart (boot = SOFT).
  */
 
 // --- Includes ---
@@ -52,6 +54,7 @@ String lockReason = "boot: no solar2 data yet";
 bool lowBatteryLatched = false;       // set below SOC/voltage shutdown, cleared above the recover thresholds
 bool safetyAlarm = false;             // battery alarm or MPPT error/fault in the last solar2 read
 volatile bool wifiLost = false;       // Wi-Fi down for WIFI_TIMEOUT (set by the ticker)
+bool operatorHardLock = false;        // POST /hardlock; only POST /hardunlock clears it
 bool lastOnAuto = false;              // true if the last successful /on came with AUTO_TOKEN (automation)
 String lastBatteryHasAlarm = "0";     // Last battery alarm value from solar2
 int solar2ConnectionStatus = 0;       // Solar2 connection status (1 = reachable, 0 = unreachable)
@@ -202,6 +205,7 @@ void readSolar2(unsigned long now) {
  * The current safety condition, or "" if none. Any condition = HARD lock.
  */
 String safetyReason(unsigned long now) {
+  if (operatorHardLock) return "operator hard lock";
   if (wifiLost) return "wifi lost";
   if (lastSuccessfulRead == 0) return "no solar2 data yet";
   if (now - lastSuccessfulRead >= DATA_STALE_TIMEOUT) return "solar2 data stale";
@@ -414,6 +418,30 @@ void setupWebServer() {
     }
     addCors(request, response);
     request->send(response);
+  });
+
+  // Operator hard lock (operator token only): off now + HARD, until /hardunlock.
+  server.on("/hardlock", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!authorized(request)) { rejectUnauthorized(request, "/hardlock"); return; }
+    operatorHardLock = true;
+    digitalWrite(INVERTER_PIN, LOW);
+    lockLevel = LOCK_HARD;
+    lockReason = "operator hard lock";
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "inverter off, hard lock set");
+    addCors(request, response);
+    request->send(response);
+    logf("HARD LOCK by operator (%s) - inverter off\n", request->client()->remoteIP().toString().c_str());
+  });
+
+  // Lift the operator hard lock (operator token only): -> SOFT, or stays HARD if a real condition holds.
+  server.on("/hardunlock", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!authorized(request)) { rejectUnauthorized(request, "/hardunlock"); return; }
+    operatorHardLock = false;
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain",
+      "operator hard lock released (soft lock unless a safety condition holds)");
+    addCors(request, response);
+    request->send(response);
+    logf("Operator hard lock released (%s)\n", request->client()->remoteIP().toString().c_str());
   });
 
   // Turn inverter OFF (operator token only): off + SOFT lock (a HARD lock stays HARD).
