@@ -6,7 +6,14 @@
  * It also provides a web server with endpoints for metrics and inverter control.
  * Control (POST /on, /off, /unlock) needs ?token=<API_TOKEN from secrets.h>; telnet is read-only.
  * Optional AUTO_TOKEN (secrets.h) is accepted only by POST /on: an automation (e.g. a mains-outage handler) can
- * switch on an unlocked inverter but can never unlock it or lock it. Without AUTO_TOKEN that path is disabled.
+ * switch on through a SOFT lock but can never unlock, lock, or pass a HARD lock. Without AUTO_TOKEN it is disabled.
+ *
+ * Locks (inverter_lock metric): 0 NONE, 1 SOFT, 2 HARD.
+ *  - HARD = a safety condition holds (battery alarm, MPPT error/fault, low battery, no fresh solar2 data, Wi-Fi
+ *    lost). The inverter is off and nothing switches it on. When the condition clears it drops to SOFT, never NONE.
+ *  - SOFT = after boot, after /off, after a hard lock cleared. Operator /on is refused until /unlock;
+ *    the AUTO token may switch on.
+ *  - NONE = after /unlock (operator token). Operator /on works.
  */
 
 // --- Includes ---
@@ -39,8 +46,12 @@ const char *password = WIFI_PASSWORD;
 const uint16_t SERVER_PORT = 8664;
 
 // --- Global Variables ---
-bool locked = true;                   // Manual inverter lock (operator-controlled)
-bool alarmActive = false;             // Safety lock: set on alarm, blocks /unlock and /on until alarm clears
+enum : uint8_t { LOCK_NONE = 0, LOCK_SOFT = 1, LOCK_HARD = 2 };
+uint8_t lockLevel = LOCK_HARD;        // boot: hard until the first fresh solar2 data, then soft
+String lockReason = "boot: no solar2 data yet";
+bool lowBatteryLatched = false;       // set below SOC/voltage shutdown, cleared above the recover thresholds
+bool safetyAlarm = false;             // battery alarm or MPPT error/fault in the last solar2 read
+volatile bool wifiLost = false;       // Wi-Fi down for WIFI_TIMEOUT (set by the ticker)
 bool lastOnAuto = false;              // true if the last successful /on came with AUTO_TOKEN (automation)
 String lastBatteryHasAlarm = "0";     // Last battery alarm value from solar2
 int solar2ConnectionStatus = 0;       // Solar2 connection status (1 = reachable, 0 = unreachable)
@@ -114,35 +125,9 @@ void printWiFiNetworks() {
 }
 
 /**
- * Polls solar2.local/metrics every 500ms.
- * - Shuts down inverter after MAX_CONSECUTIVE_FAILS (10 × 500ms = 5s) HTTP failures
- * - Shuts down if no successful read for DATA_STALE_TIMEOUT (30s)
- * - Sets alarmActive on battery/MPPT alarm; only clears it when both read as clean
+ * Reads solar2's metrics once (called every 500 ms while Wi-Fi is up). Updates the readings and the safety flags.
  */
-void checkBatteryAlarmAndShutdown() {
-  static unsigned long lastCheck = 0;
-  unsigned long now = millis();
-
-  if (now - lastCheck < 500) {
-    return;
-  }
-  lastCheck = now;
-
-  // Data staleness safety: if we had at least one successful read but data went stale, shut down.
-  // NOTE: do NOT return here — polling must continue so recovery is possible when solar2 comes back.
-  if (lastSuccessfulRead > 0 && (now - lastSuccessfulRead) >= DATA_STALE_TIMEOUT) {
-    if (!alarmActive) {
-      digitalWrite(INVERTER_PIN, LOW);
-      locked = true;
-      alarmActive = true;
-      logf("Inverter shutdown: no solar2 data for %lu seconds!\n", (now - lastSuccessfulRead) / 1000UL);
-    }
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
+void readSolar2(unsigned long now) {
   WiFiClient client;
   HTTPClient http;
   http.setTimeout(2000);
@@ -152,15 +137,8 @@ void checkBatteryAlarmAndShutdown() {
 
   if (httpCode != HTTP_CODE_OK) {
     http.end();
-    solar2ReadFailCount++;
+    if (solar2ReadFailCount < 1000) solar2ReadFailCount++;
     solar2ConnectionStatus = 0;
-    if (solar2ReadFailCount >= MAX_CONSECUTIVE_FAILS) {
-      digitalWrite(INVERTER_PIN, LOW);
-      locked = true;
-      alarmActive = true;
-      logf("Inverter shutdown: %d consecutive solar2 failures (HTTP %d)!\n",
-           solar2ReadFailCount, httpCode);
-    }
     return;
   }
 
@@ -171,128 +149,94 @@ void checkBatteryAlarmAndShutdown() {
   String payload = http.getString();
   http.end();
 
-  bool batteryAlarm = false;
-  bool mpptError = false;
-
-  // --- Check Battery Alarm ---
-  String search = "esphome_binary_sensor_value{id=\"battery_has_alarm\"";
-  int idx = payload.indexOf(search);
-  if (idx != -1) {
-    int valueStart = payload.indexOf('}', idx);
-    if (valueStart != -1) {
-      valueStart++;
-      while (valueStart < (int)payload.length() && isspace(payload[valueStart])) valueStart++;
-      int valueEnd = valueStart;
-      while (valueEnd < (int)payload.length() && !isspace(payload[valueEnd])) valueEnd++;
-      String valueStr = payload.substring(valueStart, valueEnd);
-      lastBatteryHasAlarm = valueStr;
-      if (valueStr.toFloat() >= 0.5f) batteryAlarm = true;
-    }
-  }
-
-  // --- Check MPPT has_error ---
-  {
-    String mpptSearch = "esphome_binary_sensor_value{id=\"mppt_has_error\"";
-    int mpptIdx = payload.indexOf(mpptSearch);
-    if (mpptIdx != -1) {
-      int valueStart = payload.indexOf('}', mpptIdx);
-      if (valueStart != -1) {
-        valueStart++;
-        while (valueStart < (int)payload.length() && isspace(payload[valueStart])) valueStart++;
-        int valueEnd = valueStart;
-        while (valueEnd < (int)payload.length() && !isspace(payload[valueEnd])) valueEnd++;
-        String valueStr = payload.substring(valueStart, valueEnd);
-        lastMpptHasError = valueStr;
-        if (valueStr.toFloat() >= 0.5f) mpptError = true;
-      }
-    }
-  }
-
-  // --- Check MPPT is_in_fault_state ---
-  {
-    String faultSearch = "esphome_binary_sensor_value{id=\"mppt_is_in_fault_state\"";
-    int faultIdx = payload.indexOf(faultSearch);
-    if (faultIdx != -1) {
-      int valueStart = payload.indexOf('}', faultIdx);
-      if (valueStart != -1) {
-        valueStart++;
-        while (valueStart < (int)payload.length() && isspace(payload[valueStart])) valueStart++;
-        int valueEnd = valueStart;
-        while (valueEnd < (int)payload.length() && !isspace(payload[valueEnd])) valueEnd++;
-        String valueStr = payload.substring(valueStart, valueEnd);
-        lastMpptFaultState = valueStr;
-        if (valueStr.toFloat() >= 0.5f) mpptError = true;
-      }
-    }
-  }
-
-  // --- Parse numeric sensors ---
-  auto parseValue = [&](const String& id, String& dest) {
-    String key = "esphome_sensor_value{id=\"" + id + "\"";
+  auto rawValue = [&](const String &key, String &dest) -> bool {
     int i = payload.indexOf(key);
-    if (i != -1) {
-      int vs = payload.indexOf('}', i);
-      if (vs != -1) {
-        vs++;
-        while (vs < (int)payload.length() && isspace(payload[vs])) vs++;
-        int ve = vs;
-        while (ve < (int)payload.length() && !isspace(payload[ve])) ve++;
-        dest = payload.substring(vs, ve);
-      }
-    }
+    if (i == -1) return false;
+    int vs = payload.indexOf('}', i);
+    if (vs == -1) return false;
+    vs++;
+    while (vs < (int)payload.length() && isspace(payload[vs])) vs++;
+    int ve = vs;
+    while (ve < (int)payload.length() && !isspace(payload[ve])) ve++;
+    dest = payload.substring(vs, ve);
+    return true;
   };
-  parseValue("battery_voltage",  lastBatteryVoltage);
-  parseValue("battery_current",  lastBatteryCurrent);
-  parseValue("state_of_charge",  lastStateOfCharge);
-  parseValue("mppt_pv_power",    lastPvPower);
 
-  // --- Parse MPPT state text ---
-  {
-    String stateSearch = "esphome_text_sensor_value{id=\"mppt_state\"";
-    int si = payload.indexOf(stateSearch);
-    if (si != -1) {
-      int valAttr = payload.indexOf("value=\"", si);
-      if (valAttr != -1) {
-        valAttr += 7;
-        int valEnd = payload.indexOf('"', valAttr);
-        if (valEnd != -1) {
-          lastMpptState = payload.substring(valAttr, valEnd);
-        }
-      }
+  bool batteryAlarm = false, mpptError = false;
+  if (rawValue("esphome_binary_sensor_value{id=\"battery_has_alarm\"", lastBatteryHasAlarm))
+    batteryAlarm = lastBatteryHasAlarm.toFloat() >= 0.5f;
+  if (rawValue("esphome_binary_sensor_value{id=\"mppt_has_error\"", lastMpptHasError))
+    mpptError = lastMpptHasError.toFloat() >= 0.5f;
+  if (rawValue("esphome_binary_sensor_value{id=\"mppt_is_in_fault_state\"", lastMpptFaultState))
+    mpptError = mpptError || lastMpptFaultState.toFloat() >= 0.5f;
+  safetyAlarm = batteryAlarm || mpptError;
+
+  rawValue("esphome_sensor_value{id=\"battery_voltage\"", lastBatteryVoltage);
+  rawValue("esphome_sensor_value{id=\"battery_current\"", lastBatteryCurrent);
+  rawValue("esphome_sensor_value{id=\"state_of_charge\"", lastStateOfCharge);
+  rawValue("esphome_sensor_value{id=\"mppt_pv_power\"", lastPvPower);
+
+  // MPPT state text
+  int si = payload.indexOf("esphome_text_sensor_value{id=\"mppt_state\"");
+  if (si != -1) {
+    int valAttr = payload.indexOf("value=\"", si);
+    if (valAttr != -1) {
+      valAttr += 7;
+      int valEnd = payload.indexOf('"', valAttr);
+      if (valEnd != -1) lastMpptState = payload.substring(valAttr, valEnd);
     }
   }
 
-  if (batteryAlarm || mpptError) {
-    if (!alarmActive) {
-      alarmActive = true;
-      logf("ALARM ACTIVE: battery=%s mppt=%s — inverter shutdown!\n",
-           lastBatteryHasAlarm.c_str(), lastMpptHasError.c_str());
-    }
-    digitalWrite(INVERTER_PIN, LOW);
-    locked = true;
-  } else {
-    // Check low SoC
-    float soc     = lastStateOfCharge.toFloat();
-    float voltage = lastBatteryVoltage.toFloat();
-    bool lowSoc     = (soc > 0.0f)     && (soc     < SOC_SHUTDOWN_THRESHOLD);
-    bool lowVoltage = (voltage > 0.0f) && (voltage < VOLTAGE_SHUTDOWN_THRESHOLD);
+  // Low battery latch with hysteresis (0 = no reading: ignored, like before)
+  float soc = lastStateOfCharge.toFloat();
+  float voltage = lastBatteryVoltage.toFloat();
+  bool lowNow = (soc > 0.0f && soc < SOC_SHUTDOWN_THRESHOLD) ||
+                (voltage > 0.0f && voltage < VOLTAGE_SHUTDOWN_THRESHOLD);
+  bool recovered = (soc <= 0.0f || soc >= SOC_RECOVER_THRESHOLD) &&
+                   (voltage <= 0.0f || voltage >= VOLTAGE_RECOVER_THRESHOLD);
+  if (lowNow) lowBatteryLatched = true;
+  else if (lowBatteryLatched && recovered) lowBatteryLatched = false;
+}
 
-    if (lowSoc || lowVoltage) {
-      if (!alarmActive) {
-        alarmActive = true;
-        logf("LOW BATTERY SHUTDOWN: SoC=%.1f%% Voltage=%.2fV\n", soc, voltage);
-      }
-      digitalWrite(INVERTER_PIN, LOW);
-      locked = true;
-    } else if (alarmActive) {
-      // Only clear alarm when BOTH SoC and voltage are above recovery thresholds
-      bool socRecovered     = (soc     <= 0.0f || soc     >= SOC_RECOVER_THRESHOLD);
-      bool voltageRecovered = (voltage <= 0.0f || voltage >= VOLTAGE_RECOVER_THRESHOLD);
-      if (socRecovered && voltageRecovered) {
-        alarmActive = false;
-        log("Alarms cleared. Alarm lock released. Use /unlock to re-enable inverter.");
-      }
+/**
+ * The current safety condition, or "" if none. Any condition = HARD lock.
+ */
+String safetyReason(unsigned long now) {
+  if (wifiLost) return "wifi lost";
+  if (lastSuccessfulRead == 0) return "no solar2 data yet";
+  if (now - lastSuccessfulRead >= DATA_STALE_TIMEOUT) return "solar2 data stale";
+  if (solar2ReadFailCount >= MAX_CONSECUTIVE_FAILS) return "solar2 unreachable";
+  if (lastBatteryHasAlarm.toFloat() >= 0.5f) return "battery alarm";
+  if (safetyAlarm) return "mppt error or fault";
+  if (lowBatteryLatched) return "low battery";  // fixed text: a changing reason would re-log and churn metric labels
+  return "";
+}
+
+/**
+ * Enforces the lock every 500 ms: a safety condition switches the inverter off and holds a HARD lock; when it
+ * clears, the lock drops to SOFT (a person or the automation decides what happens next).
+ */
+void checkBatteryAlarmAndShutdown() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 500) return;
+  lastCheck = now;
+
+  if (WiFi.status() == WL_CONNECTED) readSolar2(now);
+  now = millis();
+
+  String reason = safetyReason(now);
+  if (reason.length() > 0) {
+    digitalWrite(INVERTER_PIN, LOW);
+    if (lockLevel != LOCK_HARD || !reason.equals(lockReason)) {
+      logf("HARD LOCK: %s - inverter off\n", reason.c_str());
     }
+    lockLevel = LOCK_HARD;
+    lockReason = reason;
+  } else if (lockLevel == LOCK_HARD) {
+    logf("Hard lock cleared (%s) -> soft lock: /unlock needed for the buttons\n", lockReason.c_str());
+    lockLevel = LOCK_SOFT;
+    lockReason = "after hard lock: " + lockReason;
   }
 }
 
@@ -367,11 +311,24 @@ void setupWebServer() {
 
     content += "# HELP alarm_active 1 if any alarm is blocking the inverter\n";
     content += "# TYPE alarm_active gauge\n";
-    content += "alarm_active " + String(alarmActive ? 1 : 0) + "\n";
+    content += "alarm_active " + String(lockLevel == LOCK_HARD ? 1 : 0) + "\n";
 
-    content += "# HELP inverter_locked 1 if the inverter is locked (boot, /off, alarm, link loss); /on is refused until /unlock\n";
+    content += "# HELP inverter_lock 0 none, 1 soft (operator /on needs /unlock; automation may switch on), 2 hard (safety: nothing switches on)\n";
+    content += "# TYPE inverter_lock gauge\n";
+    content += "inverter_lock " + String(lockLevel) + "\n";
+
+    content += "# HELP inverter_lock_info why the inverter is locked (label reason)\n";
+    content += "# TYPE inverter_lock_info gauge\n";
+    {
+      String r = lockLevel == LOCK_NONE ? String("") : lockReason;
+      r.replace("\\", "/");
+      r.replace("\"", "'");
+      content += "inverter_lock_info{reason=\"" + r + "\"} 1\n";
+    }
+
+    content += "# HELP inverter_locked 1 if any lock (soft or hard) is set; kept for compatibility\n";
     content += "# TYPE inverter_locked gauge\n";
-    content += "inverter_locked " + String(locked ? 1 : 0) + "\n";
+    content += "inverter_locked " + String(lockLevel != LOCK_NONE ? 1 : 0) + "\n";
 
     content += "# HELP inverter_last_on_auto 1 if the last successful /on came from the automation token\n";
     content += "# TYPE inverter_last_on_auto gauge\n";
@@ -417,26 +374,25 @@ void setupWebServer() {
     request->send(200, "text/plain", content);
   });
 
-  // Unlock the inverter (blocked while alarm is active)
+  // Unlock (operator token only): SOFT -> NONE. Refused while a HARD lock holds.
   server.on("/unlock", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!authorized(request)) { rejectUnauthorized(request, "/unlock"); return; }
     AsyncWebServerResponse *response;
-    if (alarmActive) {
-      response = request->beginResponse(409, "text/plain",
-        "Cannot unlock: alarm active (battery=" + lastBatteryHasAlarm + " mppt=" + lastMpptHasError + ")");
-      logf("Unlock rejected: alarm active (battery=%s mppt=%s)\n",
-           lastBatteryHasAlarm.c_str(), lastMpptHasError.c_str());
+    if (lockLevel == LOCK_HARD) {
+      response = request->beginResponse(409, "text/plain", "Cannot unlock: hard lock (" + lockReason + ")");
+      logf("Unlock rejected: hard lock (%s)\n", lockReason.c_str());
     } else {
-      locked = false;
+      lockLevel = LOCK_NONE;
+      lockReason = "";
       response = request->beginResponse(200, "text/plain", "Inverter unlocked.");
       log("Inverter unlocked.");
     }
-
     addCors(request, response);
     request->send(response);
   });
 
-  // Turn inverter ON endpoint
+  // Turn inverter ON: HARD refuses everyone (409); SOFT refuses the operator token (404, "locked"), the
+  // AUTO token may pass it; NONE: on.
   server.on("/on", HTTP_POST, [](AsyncWebServerRequest *request) {
     bool manual = authorized(request);
     bool automatic = !manual && authorizedAuto(request);
@@ -444,35 +400,31 @@ void setupWebServer() {
     const char *by = automatic ? "auto" : "operator";
     String ip = request->client()->remoteIP().toString();
     AsyncWebServerResponse *response;
-    if (alarmActive) {
-      response = request->beginResponse(409, "text/plain",
-        "inverter blocked: alarm active (battery=" + lastBatteryHasAlarm + " mppt=" + lastMpptHasError + ")");
-      logf("Inverter ON (%s, %s) rejected: alarm active (battery=%s mppt=%s)\n", by, ip.c_str(),
-           lastBatteryHasAlarm.c_str(), lastMpptHasError.c_str());
-    } else if (locked) {
-      response = request->beginResponse(404, "text/plain", "inverter locked");
-      logf("Inverter ON (%s, %s) rejected - locked!\n", by, ip.c_str());
+    if (lockLevel == LOCK_HARD) {
+      response = request->beginResponse(409, "text/plain", "inverter blocked: hard lock (" + lockReason + ")");
+      logf("Inverter ON (%s, %s) rejected: hard lock (%s)\n", by, ip.c_str(), lockReason.c_str());
+    } else if (lockLevel == LOCK_SOFT && manual) {
+      response = request->beginResponse(404, "text/plain", "inverter locked (soft): unlock first");
+      logf("Inverter ON (%s, %s) rejected - soft lock\n", by, ip.c_str());
     } else {
       digitalWrite(INVERTER_PIN, HIGH);
       lastOnAuto = automatic;
       response = request->beginResponse(200, "text/plain", "inverter turned on");
-      logf("Inverter turned ON (%s, %s)!\n", by, ip.c_str());
+      logf("Inverter turned ON (%s, %s, lock was %d)!\n", by, ip.c_str(), lockLevel);
     }
-
     addCors(request, response);
     request->send(response);
   });
 
-  // Turn inverter OFF endpoint
+  // Turn inverter OFF (operator token only): off + SOFT lock (a HARD lock stays HARD).
   server.on("/off", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!authorized(request)) { rejectUnauthorized(request, "/off"); return; }
     digitalWrite(INVERTER_PIN, LOW);
-    locked = true;  // Always lock after turning off
-
+    if (lockLevel != LOCK_HARD) { lockLevel = LOCK_SOFT; lockReason = "operator off"; }
     AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "inverter turned off");
     addCors(request, response);
     request->send(response);
-    log("Inverter turned OFF and locked!");
+    log("Inverter turned OFF (soft lock).");
   });
 }
 
@@ -486,14 +438,15 @@ void checkWiFiConnection() {
       wifiDisconnectTime = millis();
       Serial.println("WiFi disconnected!");
     } else if (millis() - wifiDisconnectTime >= WIFI_TIMEOUT) {
-      // WiFi has been disconnected for too long
+      // WiFi has been disconnected for too long: off now; the loop holds the HARD lock ("wifi lost")
       digitalWrite(INVERTER_PIN, LOW);
-      locked = true;
-      Serial.println("Inverter shutdown due to prolonged WiFi disconnection!");
+      if (!wifiLost) Serial.println("Inverter shutdown due to prolonged WiFi disconnection!");
+      wifiLost = true;
     }
   } else {
     // WiFi is connected, reset disconnect timer
     wifiDisconnectTime = 0;
+    wifiLost = false;
   }
 }
 
@@ -563,8 +516,8 @@ void handleTelnetMenu() {
   } else if (cmd == "status") {
     TelnetStream.println("\r\n=== Status ===");
     TelnetStream.printf("  Inverter pin  : %s\r\n", digitalRead(INVERTER_PIN) ? "ON" : "OFF");
-    TelnetStream.printf("  Locked        : %s\r\n", locked ? "YES" : "NO");
-    TelnetStream.printf("  Alarm active  : %s\r\n", alarmActive ? "YES" : "NO");
+    TelnetStream.printf("  Lock          : %s %s\r\n",
+                        lockLevel == LOCK_HARD ? "HARD" : lockLevel == LOCK_SOFT ? "SOFT" : "NONE", lockReason.c_str());
     TelnetStream.printf("  Last ON by    : %s\r\n", lastOnAuto ? "automation" : "operator");
     TelnetStream.printf("  Battery alarm : %s\r\n", lastBatteryHasAlarm.c_str());
     TelnetStream.printf("  Battery V     : %s V\r\n", lastBatteryVoltage.c_str());
