@@ -15,7 +15,10 @@
  *    the AUTO token may switch on.
  *  - NONE = after /unlock (operator token). Operator /on works.
  *  - POST /hardlock (operator token): inverter off + HARD lock "operator hard lock" (maintenance / tests); only
- *    POST /hardunlock (operator token) lifts it, not conditions clearing. Not kept across a restart (boot = SOFT).
+ *    POST /hardunlock (operator token) lifts it, not conditions clearing. Kept across restarts: a flag file on
+ *    LittleFS, read at boot before anything else. If the file system can't be mounted the controller boots HARD
+ *    ("lock storage error"); /hardunlock clears that too (operator decision). Unlock lifts the RAM lock only after
+ *    the file is gone (fail-safe), so a failed delete keeps the lock.
  */
 
 // --- Includes ---
@@ -28,6 +31,7 @@
 #include <ArduinoOTA.h>
 #include <ESP8266mDNS.h>
 #include <TelnetStream.h>
+#include <LittleFS.h>
 #include "secrets.h"  // Wi-Fi and OTA passwords live here, outside git (see secrets.example.h)
 #ifndef AUTO_TOKEN
 #define AUTO_TOKEN ""  // empty = the on-only automation token is disabled
@@ -54,7 +58,13 @@ String lockReason = "boot: no solar2 data yet";
 bool lowBatteryLatched = false;       // set below SOC/voltage shutdown, cleared above the recover thresholds
 bool safetyAlarm = false;             // battery alarm or MPPT error/fault in the last solar2 read
 volatile bool wifiLost = false;       // Wi-Fi down for WIFI_TIMEOUT (set by the ticker)
-bool operatorHardLock = false;        // POST /hardlock; only POST /hardunlock clears it
+bool operatorHardLock = false;        // POST /hardlock; only POST /hardunlock clears it (persistent, see below)
+const char *HARDLOCK_FILE = "/hardlock";
+bool lockStoreOk = false;             // LittleFS mounted
+bool lockStoreError = false;          // mount failed at boot: HARD until the operator clears it
+bool hardlockStored = false;          // the flag file exists
+volatile bool pendingHardlockWrite = false;  // set by /hardlock, done in loop() (no flash writes in web callbacks)
+volatile bool pendingHardlockClear = false;  // set by /hardunlock, done in loop()
 bool lastOnAuto = false;              // true if the last successful /on came with AUTO_TOKEN (automation)
 String lastBatteryHasAlarm = "0";     // Last battery alarm value from solar2
 int solar2ConnectionStatus = 0;       // Solar2 connection status (1 = reachable, 0 = unreachable)
@@ -206,6 +216,7 @@ void readSolar2(unsigned long now) {
  */
 String safetyReason(unsigned long now) {
   if (operatorHardLock) return "operator hard lock";
+  if (lockStoreError) return "lock storage error";
   if (wifiLost) return "wifi lost";
   if (lastSuccessfulRead == 0) return "no solar2 data yet";
   if (now - lastSuccessfulRead >= DATA_STALE_TIMEOUT) return "solar2 data stale";
@@ -330,6 +341,14 @@ void setupWebServer() {
       content += "inverter_lock_info{reason=\"" + r + "\"} 1\n";
     }
 
+    content += "# HELP inverter_hardlock_persistent 1 if the operator hard lock is stored on flash (survives a restart)\n";
+    content += "# TYPE inverter_hardlock_persistent gauge\n";
+    content += "inverter_hardlock_persistent " + String(hardlockStored ? 1 : 0) + "\n";
+
+    content += "# HELP lock_store_ok 1 if the lock storage (LittleFS) is mounted\n";
+    content += "# TYPE lock_store_ok gauge\n";
+    content += "lock_store_ok " + String(lockStoreOk ? 1 : 0) + "\n";
+
     content += "# HELP inverter_locked 1 if any lock (soft or hard) is set; kept for compatibility\n";
     content += "# TYPE inverter_locked gauge\n";
     content += "inverter_locked " + String(lockLevel != LOCK_NONE ? 1 : 0) + "\n";
@@ -424,10 +443,13 @@ void setupWebServer() {
   server.on("/hardlock", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!authorized(request)) { rejectUnauthorized(request, "/hardlock"); return; }
     operatorHardLock = true;
+    pendingHardlockWrite = true;
     digitalWrite(INVERTER_PIN, LOW);
     lockLevel = LOCK_HARD;
     lockReason = "operator hard lock";
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "inverter off, hard lock set");
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain",
+      lockStoreOk ? "inverter off, hard lock set (stored, survives a restart)"
+                  : "inverter off, hard lock set (NOT stored: lock storage error)");
     addCors(request, response);
     request->send(response);
     logf("HARD LOCK by operator (%s) - inverter off\n", request->client()->remoteIP().toString().c_str());
@@ -436,9 +458,9 @@ void setupWebServer() {
   // Lift the operator hard lock (operator token only): -> SOFT, or stays HARD if a real condition holds.
   server.on("/hardunlock", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!authorized(request)) { rejectUnauthorized(request, "/hardunlock"); return; }
-    operatorHardLock = false;
+    pendingHardlockClear = true;   // loop() deletes the file, then lifts the lock
     AsyncWebServerResponse *response = request->beginResponse(200, "text/plain",
-      "operator hard lock released (soft lock unless a safety condition holds)");
+      "operator hard lock release requested (soft lock within a second unless a safety condition holds)");
     addCors(request, response);
     request->send(response);
     logf("Operator hard lock released (%s)\n", request->client()->remoteIP().toString().c_str());
@@ -544,6 +566,7 @@ void handleTelnetMenu() {
   } else if (cmd == "status") {
     TelnetStream.println("\r\n=== Status ===");
     TelnetStream.printf("  Inverter pin  : %s\r\n", digitalRead(INVERTER_PIN) ? "ON" : "OFF");
+    TelnetStream.printf("  Hard lock file: %s (storage %s)\r\n", hardlockStored ? "yes" : "no", lockStoreOk ? "ok" : "ERROR");
     TelnetStream.printf("  Lock          : %s %s\r\n",
                         lockLevel == LOCK_HARD ? "HARD" : lockLevel == LOCK_SOFT ? "SOFT" : "NONE", lockReason.c_str());
     TelnetStream.printf("  Last ON by    : %s\r\n", lastOnAuto ? "automation" : "operator");
@@ -613,6 +636,19 @@ void setup() {
   // Initialize GPIO pins
   pinMode(INVERTER_PIN, OUTPUT);
   digitalWrite(INVERTER_PIN, LOW);  // Start with inverter OFF
+
+  // Persistent operator hard lock: read before anything can switch the inverter on
+  lockStoreOk = LittleFS.begin();
+  if (!lockStoreOk) {
+    lockStoreError = true;
+    lockLevel = LOCK_HARD;
+    lockReason = "lock storage error";
+  } else if (LittleFS.exists(HARDLOCK_FILE)) {
+    operatorHardLock = true;
+    hardlockStored = true;
+    lockLevel = LOCK_HARD;
+    lockReason = "operator hard lock";
+  }
   
   log("\nESP8266 Solar Monitor & Inverter Controller starting...");
   
@@ -679,9 +715,46 @@ const unsigned long CHECK_INTERVAL = 500;  // Check every 500ms
 /**
  * Main program loop - runs continuously
  */
+/**
+ * Flash writes for the operator hard lock, outside the web callbacks. Fail-safe: the lock is lifted only after
+ * the flag file is really gone.
+ */
+void handleHardlockStore() {
+  if (pendingHardlockWrite) {
+    pendingHardlockWrite = false;
+    if (lockStoreOk) {
+      File f = LittleFS.open(HARDLOCK_FILE, "w");
+      bool ok = f && f.print("1") == 1;
+      if (f) f.close();
+      hardlockStored = ok && LittleFS.exists(HARDLOCK_FILE);
+      logf("Operator hard lock %s\n", hardlockStored ? "stored" : "NOT stored (write failed)");
+    }
+  }
+  if (pendingHardlockClear) {
+    pendingHardlockClear = false;
+    if (pendingHardlockWrite) return;  // a new /hardlock came in meanwhile: it wins
+    bool gone = true;
+    if (lockStoreOk && LittleFS.exists(HARDLOCK_FILE)) {
+      LittleFS.remove(HARDLOCK_FILE);
+      gone = !LittleFS.exists(HARDLOCK_FILE);
+    }
+    if (gone) {
+      operatorHardLock = false;
+      lockStoreError = false;
+      hardlockStored = false;
+      log("Operator hard lock released.");
+    } else {
+      log("Operator hard lock NOT released: could not delete the stored lock.");
+    }
+  }
+}
+
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
+
+  // Store / clear the operator hard lock (flash writes stay out of the web callbacks)
+  handleHardlockStore();
   
   // Check battery/MPPT status from solar2 and enforce shutdown if needed
   checkBatteryAlarmAndShutdown();
