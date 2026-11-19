@@ -660,12 +660,19 @@ void setup() {
   WiFi.setSleepMode(WIFI_NONE_SLEEP);    // Keep radio always on
   WiFi.hostname("solar_inverter");       // Set hostname before connect
   
-  // Static IP configuration — faster reconnect, no DHCP dependency
-  IPAddress staticIP(192, 168, 178, 122);
-  IPAddress gateway(192, 168, 178, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns(192, 168, 178, 75);
-  WiFi.config(staticIP, gateway, subnet, dns);
+  // Static IP (faster reconnect, no DHCP dependency) from secrets.h: STATIC_IP, GATEWAY_IP, DNS_IP as
+  // "a.b.c.d" strings. Without them the controller uses DHCP.
+#if defined(STATIC_IP) && defined(GATEWAY_IP) && defined(DNS_IP)
+  {
+    IPAddress staticIP, gateway, dns;
+    IPAddress subnet(255, 255, 255, 0);
+    if (staticIP.fromString(STATIC_IP) && gateway.fromString(GATEWAY_IP) && dns.fromString(DNS_IP)) {
+      WiFi.config(staticIP, gateway, subnet, dns);
+    } else {
+      log("Static IP in secrets.h is not valid: using DHCP");
+    }
+  }
+#endif
   
   WiFi.begin(ssid, password);
   WiFi.setAutoReconnect(true);

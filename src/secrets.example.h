@@ -10,3 +10,7 @@
 #define AUTO_TOKEN "choose-another-long-random-token"
 // solar2's metrics by fixed IP (no DNS dependency), e.g. "http://192.168.1.50/metrics"
 #define SOLAR2_METRICS_URL "http://192.168.1.50/metrics"
+// Optional static address (otherwise DHCP), e.g.:
+#define STATIC_IP "192.168.1.60"
+#define GATEWAY_IP "192.168.1.1"
+#define DNS_IP "192.168.1.2"
